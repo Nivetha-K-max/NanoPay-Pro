@@ -1,0 +1,135 @@
+# Base config — shared across all profiles.
+# Profile-specific files (application-dev.yml, application-prod.yml) override these.
+spring:
+  application:
+    name: nanopay-pro
+
+  profiles:
+    active: ${APP_PROFILE:dev}   # override via env var in prod
+
+  # JPA — DDL is managed by Flyway, NOT by Hibernate auto-ddl
+  jpa:
+    hibernate:
+      ddl-auto: validate          # fail fast if schema drifts from entities
+    show-sql: false               # never true in prod — use slow-query logging instead
+    open-in-view: false           # prevents lazy-load N+1 in controllers
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+        jdbc:
+          batch_size: 50          # batch inserts for audit log writes
+        order_inserts: true
+        order_updates: true
+
+  # Flyway — migrations run before app starts, blocking startup on failure
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    out-of-order: false           # enforce strict version ordering in prod
+
+  # Redis — Lettuce with connection pooling
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+          max-wait: 1000ms
+
+  # Kafka
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all               # wait for all replicas to acknowledge — no data loss
+      retries: 3
+      properties:
+        enable.idempotence: true    # prevents duplicate messages on retry
+        max.in.flight.requests.per.connection: 1
+    consumer:
+      group-id: nanopay-consumer-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false   # manual commit — we commit only after processing
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.nanopay.*"
+
+  # Mail
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+  # OAuth2
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID:}
+            client-secret: ${GOOGLE_CLIENT_SECRET:}
+            scope: email, profile
+
+# JWT config — keys injected from env, never hardcoded
+app:
+  jwt:
+    secret: ${JWT_SECRET:}          # min 512-bit key for HS512
+    access-token-expiry: 900000     # 15 minutes in ms
+    refresh-token-expiry: 604800000 # 7 days in ms
+
+  # Fraud detection thresholds
+  fraud:
+    single-transaction-limit: 10000.00
+    daily-limit: 50000.00
+    velocity-window-minutes: 60
+    max-transactions-per-window: 20
+    max-fraud-flags-before-block: 3
+
+  # Rate limiting
+  rate-limit:
+    login-attempts: 5
+    login-window-seconds: 60
+    api-requests-per-minute: 100
+
+  # Frontend URL for CORS
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+
+# Actuator — expose only what Prometheus needs, not everything
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus, metrics
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+
+# Logging — structured JSON in prod, readable in dev
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level [%X{traceId}] %logger{36} - %msg%n"
+  level:
+    root: INFO
+    com.nanopay: DEBUG
+    org.springframework.security: INFO
