@@ -26,7 +26,7 @@ vi.mock('@/lib/api', () => ({
 import { api } from '@/lib/api';
 import { useAuth } from '@/store/auth';
 
-const mockApi = api as { login: ReturnType<typeof vi.fn>; register: ReturnType<typeof vi.fn> };
+const mockApi = api as unknown as { login: ReturnType<typeof vi.fn>; register: ReturnType<typeof vi.fn> };
 
 const MOCK_USER = {
   id: 'user_1',
