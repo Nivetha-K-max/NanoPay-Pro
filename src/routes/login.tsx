@@ -34,7 +34,7 @@ function LoginPage() {
     setErr(null);
     setLoading(true);
     try {
-      await signIn(email);
+      await signIn(email, pw);
       navigate({ to: "/dashboard" });
     } catch {
       setErr("Email or password is incorrect.");
