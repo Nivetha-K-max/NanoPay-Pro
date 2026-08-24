@@ -1,0 +1,545 @@
+package com.nanopay.core.service;
+
+import com.nanopay.common.dto.transaction.*;
+import com.nanopay.common.event.TransactionEvent;
+import com.nanopay.common.exception.*;
+import com.nanopay.core.domain.entity.*;
+import com.nanopay.core.mapper.TransactionMapper;
+import com.nanopay.infrastructure.kafka.TransactionEventProducer;
+import com.nanopay.infrastructure.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.UUID;
+
+/**
+ * The core transaction engine.
+ *
+ * Concurrency strategy:
+ * - Isolation.SERIALIZABLE on all mutation methods: strictest isolation level.
+ *   Prevents phantom reads and non-repeatable reads.
+ * - Pessimistic WRITE locks on wallet rows (via repository): only one thread
+ *   can modify a wallet at a time — prevents double-spend.
+ * - @Version (optimistic lock) on Transaction entity: prevents concurrent
+ *   status updates on the same transaction from both succeeding.
+ *
+ * Idempotency:
+ * - Every mutating operation requires an idempotency key.
+ * - If a key is already in the DB, we return the existing result immediately.
+ * - This means safe client retry on network failure.
+ *
+ * State machine: PENDING → PROCESSING → SUCCESS / FAILED
+ *                SUCCESS → REVERSED (via reversal transaction)
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TransactionService {
+
+    private final TransactionRepository transactionRepository;
+    private final WalletRepository walletRepository;
+    private final UserRepository userRepository;
+    private final TransactionMapper transactionMapper;
+    private final FraudDetectionService fraudDetectionService;
+    private final TransactionEventProducer eventProducer;
+    private final AuditService auditService;
+
+    // ── Deposit ────────────────────────────────────────────────────────────
+
+    /**
+     * Credit funds to a wallet from an external source.
+     * No sender wallet — amount appears in receiver wallet balance.
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public TransactionResponse deposit(Long userId, DepositRequest request,
+                                        String ipAddress) {
+        // Idempotency check — must happen before any lock acquisition
+        if (transactionRepository.existsByIdempotencyKey(request.getIdempotencyKey())) {
+            return transactionRepository
+                .findByIdempotencyKey(request.getIdempotencyKey())
+                .map(transactionMapper::toResponse)
+                .orElseThrow();
+        }
+
+        User user = loadUser(userId);
+
+        // Acquire pessimistic write lock on the wallet before reading balance
+        Wallet wallet = walletRepository
+            .findByUserIdAndCurrencyWithLock(userId, request.getCurrency())
+            .orElseThrow(() -> new ResourceNotFoundException("Wallet", "userId", userId));
+
+        validateWalletActive(wallet);
+
+        // Create transaction record in PENDING state first
+        Transaction tx = buildTransaction(
+            request.getIdempotencyKey(),
+            Transaction.TransactionType.DEPOSIT,
+            null, wallet,
+            request.getAmount(), request.getCurrency(),
+            BigDecimal.ZERO,  // no fee on deposits
+            request.getDescription(), ipAddress, user
+        );
+        tx.transitionTo(Transaction.TransactionStatus.PENDING, null, "Deposit initiated");
+        tx = transactionRepository.save(tx);
+
+        try {
+            // Transition to PROCESSING before touching balances
+            tx.transitionTo(Transaction.TransactionStatus.PROCESSING, null,
+                           "Processing deposit");
+            transactionRepository.save(tx);
+
+            // Fraud check on deposit
+            BigDecimal fraudScore = fraudDetectionService.evaluate(tx, null);
+            tx.setFraudScore(fraudScore);
+            tx.setFraudChecked(true);
+
+            // Credit the wallet
+            wallet.credit(request.getAmount());
+            walletRepository.save(wallet);
+
+            // Mark transaction SUCCESS
+            tx.transitionTo(Transaction.TransactionStatus.SUCCESS, null,
+                           "Deposit completed");
+            tx.setCompletedAt(Instant.now());
+            tx = transactionRepository.save(tx);
+
+            log.info("Deposit completed: txId={}, userId={}, amount={}",
+                     tx.getId(), userId, request.getAmount());
+
+            publishEvent(tx, "COMPLETED");
+            auditService.log(userId, "DEPOSIT", "TRANSACTION", tx.getId(),
+                            ipAddress, null, AuditLog.Outcome.SUCCESS, null);
+
+            return transactionMapper.toResponse(tx);
+
+        } catch (FraudDetectedException e) {
+            failTransaction(tx, user, "FRAUD_BLOCKED: " + e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            failTransaction(tx, user, "SYSTEM_ERROR: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    // ── Withdrawal ─────────────────────────────────────────────────────────
+
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public TransactionResponse withdraw(Long userId, WithdrawalRequest request,
+                                         String ipAddress) {
+        if (transactionRepository.existsByIdempotencyKey(request.getIdempotencyKey())) {
+            return transactionRepository
+                .findByIdempotencyKey(request.getIdempotencyKey())
+                .map(transactionMapper::toResponse)
+                .orElseThrow();
+        }
+
+        User user = loadUser(userId);
+
+        // Lock wallet before reading balance — prevents race condition
+        Wallet wallet = walletRepository
+            .findByUserIdAndCurrencyWithLock(userId, request.getCurrency())
+            .orElseThrow(() -> new ResourceNotFoundException("Wallet", "userId", userId));
+
+        validateWalletActive(wallet);
+
+        // Pre-check balance before creating the transaction record
+        // to avoid creating FAILED transactions for obviously insufficient funds
+        if (!wallet.hasSufficientBalance(request.getAmount())) {
+            throw new InsufficientFundsException();
+        }
+
+        Transaction tx = buildTransaction(
+            request.getIdempotencyKey(),
+            Transaction.TransactionType.WITHDRAWAL,
+            wallet, null,
+            request.getAmount(), request.getCurrency(),
+            calculateFee(request.getAmount()),
+            request.getDescription(), ipAddress, user
+        );
+        tx.transitionTo(Transaction.TransactionStatus.PENDING, null, "Withdrawal initiated");
+        tx = transactionRepository.save(tx);
+
+        try {
+            tx.transitionTo(Transaction.TransactionStatus.PROCESSING, null,
+                           "Processing withdrawal");
+            transactionRepository.save(tx);
+
+            BigDecimal fraudScore = fraudDetectionService.evaluate(tx, wallet);
+            tx.setFraudScore(fraudScore);
+            tx.setFraudChecked(true);
+
+            // Debit — throws InsufficientFundsException if balance changed
+            // between our pre-check and now (e.g., another thread withdrew first)
+            wallet.debit(request.getAmount());
+            walletRepository.save(wallet);
+
+            tx.transitionTo(Transaction.TransactionStatus.SUCCESS, null,
+                           "Withdrawal completed");
+            tx.setCompletedAt(Instant.now());
+            tx = transactionRepository.save(tx);
+
+            log.info("Withdrawal completed: txId={}, userId={}, amount={}",
+                     tx.getId(), userId, request.getAmount());
+
+            publishEvent(tx, "COMPLETED");
+            auditService.log(userId, "WITHDRAWAL", "TRANSACTION", tx.getId(),
+                            ipAddress, null, AuditLog.Outcome.SUCCESS, null);
+
+            return transactionMapper.toResponse(tx);
+
+        } catch (FraudDetectedException | InsufficientFundsException e) {
+            failTransaction(tx, user, e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            failTransaction(tx, user, "SYSTEM_ERROR: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    // ── Transfer ───────────────────────────────────────────────────────────
+
+    /**
+     * Move funds from one wallet to another atomically.
+     *
+     * Deadlock prevention: always acquire wallet locks in ascending ID order.
+     * If thread A locks wallet 5 then 10, and thread B locks wallet 10 then 5,
+     * they deadlock. By always locking lower ID first, both threads acquire
+     * in the same order — deadlock is impossible.
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public TransactionResponse transfer(Long senderUserId, TransferRequest request,
+                                         String ipAddress) {
+        if (transactionRepository.existsByIdempotencyKey(request.getIdempotencyKey())) {
+            return transactionRepository
+                .findByIdempotencyKey(request.getIdempotencyKey())
+                .map(transactionMapper::toResponse)
+                .orElseThrow();
+        }
+
+        User sender = loadUser(senderUserId);
+
+        User recipient = userRepository.findByEmail(request.getRecipientEmail())
+            .orElseThrow(() -> new ResourceNotFoundException(
+                "User", "email", request.getRecipientEmail()));
+
+        if (sender.getId().equals(recipient.getId())) {
+            throw new NanoPayException(
+                "Cannot transfer to your own wallet",
+                org.springframework.http.HttpStatus.BAD_REQUEST,
+                "SELF_TRANSFER"
+            );
+        }
+
+        // Load both wallets — but acquire locks in ID order to prevent deadlock
+        Wallet senderWallet = walletRepository
+            .findByUserIdAndCurrency(senderUserId, request.getCurrency())
+            .orElseThrow(() -> new ResourceNotFoundException("Wallet", "userId", senderUserId));
+
+        Wallet receiverWallet = walletRepository
+            .findByUserIdAndCurrency(recipient.getId(), request.getCurrency())
+            .orElseThrow(() -> new ResourceNotFoundException(
+                "Wallet", "userId", recipient.getId()));
+
+        // Acquire locks in ascending ID order — deadlock prevention
+        Wallet firstLock, secondLock;
+        if (senderWallet.getId() < receiverWallet.getId()) {
+            firstLock = walletRepository
+                .findByIdWithLock(senderWallet.getId()).orElseThrow();
+            secondLock = walletRepository
+                .findByIdWithLock(receiverWallet.getId()).orElseThrow();
+        } else {
+            firstLock = walletRepository
+                .findByIdWithLock(receiverWallet.getId()).orElseThrow();
+            secondLock = walletRepository
+                .findByIdWithLock(senderWallet.getId()).orElseThrow();
+        }
+
+        // Re-assign to named variables after locking
+        senderWallet   = senderWallet.getId().equals(firstLock.getId()) ? firstLock : secondLock;
+        receiverWallet = receiverWallet.getId().equals(firstLock.getId()) ? firstLock : secondLock;
+
+        validateWalletActive(senderWallet);
+        validateWalletActive(receiverWallet);
+
+        if (!senderWallet.hasSufficientBalance(request.getAmount())) {
+            throw new InsufficientFundsException();
+        }
+
+        BigDecimal fee = calculateFee(request.getAmount());
+
+        Transaction tx = buildTransaction(
+            request.getIdempotencyKey(),
+            Transaction.TransactionType.TRANSFER,
+            senderWallet, receiverWallet,
+            request.getAmount(), request.getCurrency(),
+            fee, request.getDescription(), ipAddress, sender
+        );
+        tx.transitionTo(Transaction.TransactionStatus.PENDING, null, "Transfer initiated");
+        tx = transactionRepository.save(tx);
+
+        try {
+            tx.transitionTo(Transaction.TransactionStatus.PROCESSING, null,
+                           "Processing transfer");
+            transactionRepository.save(tx);
+
+            BigDecimal fraudScore = fraudDetectionService.evaluate(tx, senderWallet);
+            tx.setFraudScore(fraudScore);
+            tx.setFraudChecked(true);
+
+            // Atomic debit + credit — both or neither
+            senderWallet.debit(request.getAmount());
+            receiverWallet.credit(tx.getNetAmount());  // receiver gets amount minus fee
+            walletRepository.save(senderWallet);
+            walletRepository.save(receiverWallet);
+
+            tx.transitionTo(Transaction.TransactionStatus.SUCCESS, null,
+                           "Transfer completed");
+            tx.setCompletedAt(Instant.now());
+            tx = transactionRepository.save(tx);
+
+            log.info("Transfer completed: txId={}, from={}, to={}, amount={}",
+                     tx.getId(), senderUserId, recipient.getId(), request.getAmount());
+
+            publishEvent(tx, "COMPLETED");
+            auditService.log(senderUserId, "TRANSFER", "TRANSACTION", tx.getId(),
+                            ipAddress, null, AuditLog.Outcome.SUCCESS, null);
+
+            return transactionMapper.toResponse(tx);
+
+        } catch (FraudDetectedException | InsufficientFundsException e) {
+            failTransaction(tx, sender, e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            failTransaction(tx, sender, "SYSTEM_ERROR: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    // ── Reversal ───────────────────────────────────────────────────────────
+
+    /**
+     * Reverse a completed transfer. Admin-only operation.
+     * Creates a new REVERSAL transaction (never modifies the original).
+     * The original transaction is marked REVERSED.
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public TransactionResponse reverse(Long originalTxId, Long adminUserId,
+                                        String reason, String ipAddress) {
+        Transaction original = transactionRepository.findById(originalTxId)
+            .orElseThrow(() -> new ResourceNotFoundException(
+                "Transaction", "id", originalTxId));
+
+        if (!original.isReversible()) {
+            throw new NanoPayException(
+                "Transaction cannot be reversed in its current state",
+                org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
+                "NOT_REVERSIBLE"
+            );
+        }
+
+        User admin = loadUser(adminUserId);
+
+        // Lock both wallets in ID order
+        Wallet senderWallet   = original.getSenderWallet();
+        Wallet receiverWallet = original.getReceiverWallet();
+
+        if (senderWallet == null || receiverWallet == null) {
+            throw new NanoPayException(
+                "Cannot reverse a deposit or withdrawal — manual reconciliation required",
+                org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
+                "REVERSAL_NOT_SUPPORTED"
+            );
+        }
+
+        Wallet firstLock, secondLock;
+        if (senderWallet.getId() < receiverWallet.getId()) {
+            firstLock  = walletRepository.findByIdWithLock(senderWallet.getId()).orElseThrow();
+            secondLock = walletRepository.findByIdWithLock(receiverWallet.getId()).orElseThrow();
+        } else {
+            firstLock  = walletRepository.findByIdWithLock(receiverWallet.getId()).orElseThrow();
+            secondLock = walletRepository.findByIdWithLock(senderWallet.getId()).orElseThrow();
+        }
+
+        senderWallet   = senderWallet.getId().equals(firstLock.getId()) ? firstLock : secondLock;
+        receiverWallet = receiverWallet.getId().equals(firstLock.getId()) ? firstLock : secondLock;
+
+        // Create the reversal transaction
+        String idempotencyKey = "reversal-" + originalTxId + "-" + UUID.randomUUID();
+        Transaction reversal = buildTransaction(
+            idempotencyKey,
+            Transaction.TransactionType.REVERSAL,
+            receiverWallet, senderWallet,  // reversed direction
+            original.getNetAmount(), original.getCurrency(),
+            BigDecimal.ZERO, "Reversal of " + original.getReferenceNumber(),
+            ipAddress, admin
+        );
+        reversal.transitionTo(Transaction.TransactionStatus.PENDING, admin,
+                             "Reversal initiated by admin");
+        reversal = transactionRepository.save(reversal);
+
+        // Move money back
+        receiverWallet.debit(original.getNetAmount());
+        senderWallet.credit(original.getNetAmount());
+        walletRepository.save(senderWallet);
+        walletRepository.save(receiverWallet);
+
+        // Mark reversal SUCCESS
+        reversal.transitionTo(Transaction.TransactionStatus.SUCCESS, admin,
+                              "Reversal completed: " + reason);
+        reversal.setCompletedAt(Instant.now());
+        reversal = transactionRepository.save(reversal);
+
+        // Mark original REVERSED
+        original.transitionTo(Transaction.TransactionStatus.REVERSED, admin,
+                              "Reversed by admin: " + reason);
+        original.setReversedById(reversal.getId());
+        transactionRepository.save(original);
+
+        auditService.log(adminUserId, "TRANSACTION_REVERSED", "TRANSACTION",
+                        originalTxId, ipAddress, null, AuditLog.Outcome.SUCCESS, null);
+
+        return transactionMapper.toResponse(reversal);
+    }
+
+    // ── Query methods ──────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public TransactionResponse getTransaction(Long txId, Long requestingUserId) {
+        Transaction tx = transactionRepository.findById(txId)
+            .orElseThrow(() -> new ResourceNotFoundException("Transaction", "id", txId));
+
+        // Security: users can only view their own transactions
+        boolean isSender   = tx.getSenderWallet() != null &&
+                             tx.getSenderWallet().getUser().getId().equals(requestingUserId);
+        boolean isReceiver = tx.getReceiverWallet() != null &&
+                             tx.getReceiverWallet().getUser().getId().equals(requestingUserId);
+        boolean isOwner    = tx.getInitiatedBy().getId().equals(requestingUserId);
+
+        if (!isSender && !isReceiver && !isOwner) {
+            throw new AccessDeniedException("Access denied to transaction " + txId);
+        }
+
+        return transactionMapper.toResponse(tx);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<TransactionResponse> getWalletHistory(
+            Long userId, String currency, Instant from, Instant to, Pageable pageable) {
+
+        Wallet wallet = walletRepository.findByUserIdAndCurrency(userId, currency)
+            .orElseThrow(() -> new ResourceNotFoundException("Wallet", "userId", userId));
+
+        return transactionRepository
+            .findByWalletIdAndDateRange(wallet.getId(), from, to, pageable)
+            .map(transactionMapper::toResponse);
+    }
+
+    @Transactional(readOnly = true)
+    public WalletResponse getWallet(Long userId) {
+        Wallet wallet = walletRepository.findByUserId(userId)
+            .orElseThrow(() -> new ResourceNotFoundException("Wallet", "userId", userId));
+        return transactionMapper.toWalletResponse(wallet);
+    }
+
+    // ── Private helpers ────────────────────────────────────────────────────
+
+    private Transaction buildTransaction(
+            String idempotencyKey, Transaction.TransactionType type,
+            Wallet sender, Wallet receiver,
+            BigDecimal amount, String currency, BigDecimal fee,
+            String description, String ipAddress, User initiatedBy) {
+
+        Transaction tx = new Transaction();
+        tx.setReferenceNumber(UUID.randomUUID().toString());
+        tx.setIdempotencyKey(idempotencyKey);
+        tx.setType(type);
+        tx.setSenderWallet(sender);
+        tx.setReceiverWallet(receiver);
+        tx.setAmount(amount);
+        tx.setCurrency(currency);
+        tx.setFee(fee);
+        tx.setNetAmount(amount.subtract(fee));
+        tx.setDescription(description);
+        tx.setIpAddress(ipAddress);
+        tx.setInitiatedBy(initiatedBy);
+        return tx;
+    }
+
+    private void failTransaction(Transaction tx, User changedBy, String reason) {
+        try {
+            tx.transitionTo(Transaction.TransactionStatus.FAILED, changedBy, reason);
+            transactionRepository.save(tx);
+            publishEvent(tx, "FAILED");
+        } catch (Exception e) {
+            // Must not throw here — we're already in an error path
+            log.error("Failed to persist transaction failure state for txId={}: {}",
+                      tx.getId(), e.getMessage());
+        }
+    }
+
+    private void publishEvent(Transaction tx, String eventType) {
+        TransactionEvent event = TransactionEvent.builder()
+            .eventType(eventType)
+            .transactionId(tx.getId())
+            .referenceNumber(tx.getReferenceNumber())
+            .transactionType(tx.getType().name())
+            .status(tx.getStatus().name())
+            .senderWalletId(tx.getSenderWallet() != null ? tx.getSenderWallet().getId() : null)
+            .senderUserId(tx.getSenderWallet() != null
+                ? tx.getSenderWallet().getUser().getId() : null)
+            .receiverWalletId(tx.getReceiverWallet() != null
+                ? tx.getReceiverWallet().getId() : null)
+            .receiverUserId(tx.getReceiverWallet() != null
+                ? tx.getReceiverWallet().getUser().getId() : null)
+            .amount(tx.getAmount())
+            .currency(tx.getCurrency())
+            .fee(tx.getFee())
+            .netAmount(tx.getNetAmount())
+            .fraudScore(tx.getFraudScore())
+            .ipAddress(tx.getIpAddress())
+            .occurredAt(Instant.now())
+            .build();
+
+        if ("COMPLETED".equals(eventType)) {
+            eventProducer.publishTransactionCompleted(event);
+        } else {
+            eventProducer.publishTransactionInitiated(event);
+        }
+    }
+
+    private User loadUser(Long userId) {
+        return userRepository.findById(userId)
+            .orElseThrow(() -> new ResourceNotFoundException("User", "id", userId));
+    }
+
+    private void validateWalletActive(Wallet wallet) {
+        if (!wallet.isActive()) {
+            throw new NanoPayException(
+                "Wallet is not active: " + wallet.getStatus(),
+                org.springframework.http.HttpStatus.FORBIDDEN,
+                "WALLET_NOT_ACTIVE"
+            );
+        }
+    }
+
+    /**
+     * Fee schedule: 0.5% for transfers, free for deposits/withdrawals.
+     * Minimum fee: $0.25. Maximum: $25.00.
+     */
+    private BigDecimal calculateFee(BigDecimal amount) {
+        BigDecimal fee = amount.multiply(new BigDecimal("0.005"))
+            .setScale(4, java.math.RoundingMode.HALF_UP);
+        BigDecimal minFee = new BigDecimal("0.2500");
+        BigDecimal maxFee = new BigDecimal("25.0000");
+        return fee.max(minFee).min(maxFee);
+    }
+}

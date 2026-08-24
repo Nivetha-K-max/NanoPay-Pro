@@ -1,0 +1,177 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: nanopay_test
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 3306:3306
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+    
+    - name: Build backend
+      working-directory: backend
+      run: mvn clean install -DskipTests
+    
+    - name: Run unit tests
+      working-directory: backend
+      run: mvn test
+    
+    - name: Run integration tests
+      working-directory: backend
+      run: mvn verify -DskipUnitTests
+      env:
+        DB_HOST: localhost
+        DB_PORT: 3306
+        DB_NAME: nanopay_test
+        DB_USERNAME: root
+        DB_PASSWORD: root
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+    
+    - name: Check code quality
+      working-directory: backend
+      run: mvn spotbugs:check pmd:check || true
+    
+    - name: SonarQube scan
+      working-directory: backend
+      run: mvn sonar:sonar -Dsonar.projectKey=nanopay-pro || true
+      env:
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        SONAR_LOGIN: ${{ secrets.SONAR_LOGIN }}
+    
+    - name: Publish test results
+      uses: EnricoMi/publish-unit-test-result-action@v2
+      if: always()
+      with:
+        files: 'backend/**/target/surefire-reports/**/*.xml'
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        cache: npm
+        cache-dependency-path: 'frontend/package-lock.json'
+    
+    - name: Install dependencies
+      working-directory: frontend
+      run: npm ci
+    
+    - name: Build frontend
+      working-directory: frontend
+      run: npm run build
+    
+    - name: Run frontend tests
+      working-directory: frontend
+      run: npm test -- --coverage || true
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    
+    - name: OWASP Dependency Check
+      working-directory: backend
+      run: mvn dependency-check:check || true
+    
+    - name: Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: 'backend/'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  deploy-dev:
+    needs: [build-and-test, build-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to dev environment
+      run: |
+        echo "Deploying to development..."
+        # Add your dev deployment logic here
+        # Example: kubectl apply -f k8s/dev/
+      env:
+        DEPLOY_KEY: ${{ secrets.DEV_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
+
+  deploy-prod:
+    needs: [build-and-test, build-frontend, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production..."
+        # Add your prod deployment logic here
+        # Example: kubectl apply -f k8s/prod/
+      env:
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.PROD_DEPLOY_HOST }}
+    
+    - name: Notify deployment
+      if: success()
+      run: |
+        echo "Deployment successful"
+        # Send Slack/email notification
