@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  password      String
+  firstName     String
+  lastName      String
+  role          Role          @default(CUSTOMER)
+  cardLast4     String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  
+  sentTransactions      Transaction[] @relation("SentTransactions")
+  receivedTransactions  Transaction[] @relation("ReceivedTransactions")
+  contacts              Contact[]
+  
+  @@map("users")
+}
+
+model Contact {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  userId    String
+  createdAt DateTime @default(now())
+  
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, email])
+  @@map("contacts")
+}
+
+model Transaction {
+  id                String            @id @default(cuid())
+  reference         String            @unique
+  type              TransactionType
+  amount            Decimal           @db.Decimal(10, 2)
+  fee               Decimal           @default(0) @db.Decimal(10, 2)
+  currency          String            @default("USD")
+  status            TransactionStatus @default(PENDING)
+  category          String?
+  fraudScore        Int               @default(0)
+  
+  senderId          String?
+  receiverId        String?
+  counterparty      String
+  counterpartyEmail String
+  
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  
+  sender            User?             @relation("SentTransactions", fields: [senderId], references: [id])
+  receiver          User?             @relation("ReceivedTransactions", fields: [receiverId], references: [id])
+  
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([status])
+  @@map("transactions")
+}
+
+enum Role {
+  CUSTOMER
+  MERCHANT
+  ADMIN
+}
+
+enum TransactionType {
+  SEND
+  RECEIVE
+  DEPOSIT
+  WITHDRAW
+  FEE
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  REVERSED
+}
